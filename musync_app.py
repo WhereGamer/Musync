@@ -377,6 +377,20 @@ def api_aliases_save():
     T.invalidate_cache()
     return jsonify({"ok": True})
 
+# ── Auto aliases: same shape ({raw: clean}), applied automatically to
+# every matching artist name (no per-track confirmation needed) — but,
+# same as manual aliases, ONLY for names explicitly listed here, so
+# nothing is ever renamed without the user having added it.
+@app.route("/api/aliases/auto")
+def api_aliases_auto():
+    return jsonify(load_json(cfg.auto_aliases_file, {}))
+
+@app.route("/api/aliases/auto/save", methods=["POST"])
+def api_aliases_auto_save():
+    save_json(cfg.auto_aliases_file, request.get_json(silent=True) or {})
+    T.invalidate_cache()
+    return jsonify({"ok": True})
+
 @app.route("/api/artists")
 def api_artists():
     """Individual artist names (already split) + track counts.

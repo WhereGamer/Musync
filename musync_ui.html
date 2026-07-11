@@ -1263,7 +1263,17 @@ select.inp{cursor:pointer}
 <div class="sheet" id="sh-aliases" style="max-height:88vh">
   <div class="sh-drag" onclick="closeSheets()"></div>
   <div class="sh-hdr"><div class="sh-title">Artist aliases</div><button class="sh-x" onclick="closeSheets()">✕</button></div>
-  <div class="sh-body" style="display:flex;flex-direction:column;gap:0;min-height:0">
+
+  <!-- Mode tabs: Manual = existing tap-an-artist flow. Auto = a plain
+       raw→clean pair list applied automatically to every matching name,
+       with no per-track confirmation — still "consent"-gated because
+       nothing is touched unless it's explicitly listed here. -->
+  <div style="display:flex;gap:8px;padding:10px 16px 0">
+    <button class="btn sm" id="alias-tab-manual" onclick="switchAliasTab('manual')" style="flex:1">Manual</button>
+    <button class="btn se sm" id="alias-tab-auto" onclick="switchAliasTab('auto')" style="flex:1">Auto</button>
+  </div>
+
+  <div id="alias-panel-manual" class="sh-body" style="display:flex;flex-direction:column;gap:0;min-height:0">
 
     <!-- Step 1: pick an artist (never free-typed — always selected from the
          already-split, individual artist list, so "MiatriSs, Восход" never
@@ -1290,6 +1300,22 @@ select.inp{cursor:pointer}
     <!-- Current mappings -->
     <div class="sec-lbl" style="padding:12px 16px 4px">Current aliases</div>
     <div id="alias-current-list" style="padding-bottom:16px"></div>
+  </div>
+
+  <div id="alias-panel-auto" class="sh-body" style="display:none;flex-direction:column;gap:0;min-height:0">
+    <div style="padding:0 16px 8px;font-size:12px;color:var(--t2);line-height:1.5">
+      Type both sides directly and add the pair — applied automatically to every matching artist name, no need to tap through the list each time.
+    </div>
+    <div style="display:flex;gap:8px;padding:0 16px 10px;align-items:center">
+      <input class="inp sm" id="alias-auto-from" type="text" placeholder="rachie🎀💌" style="flex:1">
+      <button class="btn se sm" onclick="swapAliasAutoFields()" title="Swap">⇄</button>
+      <input class="inp sm" id="alias-auto-to" type="text" placeholder="Rachie" style="flex:1">
+    </div>
+    <div style="padding:0 16px 12px">
+      <button class="btn pr sm" onclick="addAutoAliasPair()" style="width:100%">Add pair</button>
+    </div>
+    <div class="sec-lbl" style="padding:4px 16px 4px">Auto aliases</div>
+    <div id="alias-auto-list" style="padding-bottom:16px"></div>
   </div>
 </div>
 
@@ -2504,10 +2530,14 @@ function openPlModal(ri){
 function openDetail(data){
   _detail=data;
   const pg=document.getElementById('det-pg'); pg.classList.add('on');
-  const cov=data.cover?'/api/cover/'+enc(data.cover):'';
+  // Detail avatar is capped at 185px in CSS — fetch a matching thumbnail
+  // (not the full-res /api/cover) so this page doesn't pull down a huge
+  // image while every grid/list view elsewhere already uses /api/thumb.
+  const cov=data.cover?'/api/thumb/'+enc(data.cover)+'?size=370':'';
+  const bgCov=data.cover?'/api/thumb/'+enc(data.cover)+'?size=600':'';
   const artEl=document.getElementById('det-art');
   artEl.src=cov; artEl.className=data.type==='artist'?'circle':'';
-  document.getElementById('det-bg').style.backgroundImage=cov?`url('${cov}')`:'';
+  document.getElementById('det-bg').style.backgroundImage=bgCov?`url('${bgCov}')`:'';
   document.getElementById('det-name').textContent=data.name||'';
   // Enrich subtitle
   const trs=data.tracks||[];
@@ -2829,21 +2859,76 @@ async function deletePlEdit(){
 // list (/api/artists), so a combined tag like "MiatriSs, Восход"
 // is never itself a single alias key — each of MiatriSs and Восход
 // is a separate, independently selectable/renamable entry.
-let _aliasArtists=[], _aliasMap={}, _aliasEditFrom='';
+let _aliasArtists=[], _aliasMap={}, _aliasEditFrom='', _aliasAutoMap={};
 
 async function openAliasSheet(){
   openSheet('sh-aliases');
   document.getElementById('alias-search').value='';
   cancelAliasEdit();
+  switchAliasTab('manual');
   try{
-    const [ar, al] = await Promise.all([
+    const [ar, al, aa] = await Promise.all([
       fetch('/api/artists').then(r=>r.json()),
       fetch('/api/aliases').then(r=>r.json()),
+      fetch('/api/aliases/auto').then(r=>r.json()),
     ]);
-    _aliasArtists = ar; _aliasMap = al;
+    _aliasArtists = ar; _aliasMap = al; _aliasAutoMap = aa;
     renderAliasArtistList('');
     renderAliasCurrentList();
+    renderAutoAliasList();
   }catch(e){ toast('Failed to load artists') }
+}
+
+function switchAliasTab(tab){
+  const manual = tab==='manual';
+  document.getElementById('alias-panel-manual').style.display = manual?'flex':'none';
+  document.getElementById('alias-panel-auto').style.display = manual?'none':'flex';
+  document.getElementById('alias-tab-manual').className = 'btn '+(manual?'':'se ')+'sm';
+  document.getElementById('alias-tab-auto').className = 'btn '+(manual?'se ':'')+'sm';
+}
+
+function swapAliasAutoFields(){
+  const a=document.getElementById('alias-auto-from'), b=document.getElementById('alias-auto-to');
+  const tmp=a.value; a.value=b.value; b.value=tmp;
+}
+
+async function addAutoAliasPair(){
+  const from=document.getElementById('alias-auto-from').value.trim();
+  const to=document.getElementById('alias-auto-to').value.trim();
+  if(!from || !to){ toast('Both fields required'); return }
+  _aliasAutoMap[from]=to;
+  await fetch('/api/aliases/auto/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_aliasAutoMap)});
+  document.getElementById('alias-auto-from').value='';
+  document.getElementById('alias-auto-to').value='';
+  renderAutoAliasList();
+  await refresh();
+  toast('Auto alias added');
+}
+
+function renderAutoAliasList(){
+  const box=document.getElementById('alias-auto-list'); if(!box) return;
+  const entries = Object.entries(_aliasAutoMap);
+  box.innerHTML='';
+  if(!entries.length){
+    box.innerHTML='<div class="empty" style="padding:16px"><div class="empty-s">No auto aliases yet</div></div>';
+    return;
+  }
+  const frag=document.createDocumentFragment();
+  entries.forEach(([from,to])=>{
+    const row=document.createElement('div'); row.className='sr';
+    row.innerHTML=`<div class="sr-ico">🏷</div><div class="sr-i"><div class="sr-t">${x(from)} → ${x(to)}</div></div><div class="pli-x" style="padding:6px">🗑</div>`;
+    row.querySelector('.pli-x').onclick=()=>removeAutoAliasMapping(from);
+    frag.appendChild(row);
+  });
+  box.appendChild(frag);
+}
+
+async function removeAutoAliasMapping(from){
+  delete _aliasAutoMap[from];
+  await fetch('/api/aliases/auto/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(_aliasAutoMap)});
+  renderAutoAliasList();
+  await refresh();
+  toast('Auto alias removed');
 }
 
 function renderAliasArtistList(filter){
