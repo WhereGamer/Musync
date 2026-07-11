@@ -97,7 +97,19 @@ def normalize_title(title: str) -> str:
 
 
 # ── Single-track parser ───────────────────────────────────
-def parse_track(f: Path, meta_store: dict = None, aliases: dict = None) -> dict:
+def parse_track(f: Path, meta_store: dict = None, aliases: dict = None,
+                 auto_aliases: dict = None, known_artists: dict = None) -> dict:
+    """
+    aliases       — manual artist renames (existing behaviour, always wins).
+    auto_aliases  — "consented" automatic renames (e.g. 'rachie🎀💌' -> 'Rachie'),
+                     applied the same way but lower priority than manual.
+    known_artists — {normalized_artist_name: occurrence_count} across the
+                     WHOLE library (built once per get_tracks() pass, cheap
+                     filename-only parse — see _build_known_artists()).
+                     Used to gate the "strip embedded artist name from title"
+                     behaviour so it only fires for an artist we already have
+                     more than one track from, never on the very first guess.
+    """
     stem = f.stem
     playlist_folder = f.parent.name if f.parent != cfg.music_dir else ""
 
@@ -144,16 +156,63 @@ def parse_track(f: Path, meta_store: dict = None, aliases: dict = None) -> dict:
             if k in meta_store[f.name]:
                 t[k] = meta_store[f.name][k]
 
-    # Apply aliases per-individual artist (never on the raw combined string)
+    # Apply aliases per-individual artist (never on the raw combined string).
+    # Auto-aliases apply first (lower priority), manual aliases always win —
+    # both only ever touch a name that's explicitly listed by the user, so
+    # nothing is ever silently renamed without that "consent".
     raw_parts = split_artists(t["artist"])
-    if aliases and raw_parts:
-        t["artists"] = [aliases.get(a, a) for a in raw_parts]
+    if raw_parts:
+        named = raw_parts
+        if auto_aliases:
+            named = [auto_aliases.get(a, a) for a in named]
+        if aliases:
+            named = [aliases.get(a, a) for a in named]
+        t["artists"] = named
         if t["artists"]:
             t["artist"] = t["artists"][0]
     else:
         t["artists"] = raw_parts
 
+    # Title cleanup: "Artist - Track" as the whole title (common with
+    # YouTube uploads that embed the artist name in the video title) only
+    # gets the artist prefix stripped once that artist is already a known,
+    # repeated entry in the library — never on a lone/unconfirmed guess.
+    if known_artists and t["artist"]:
+        m = re.match(r"^\s*(.+?)\s*-\s*(.+)$", t["title"])
+        if m:
+            lead, rest = m.group(1).strip(), m.group(2).strip()
+            lead_norm = normalize_artist(lead).lower()
+            artist_norm = t["artist"].strip().lower()
+            if rest and lead_norm == artist_norm and known_artists.get(artist_norm, 0) >= 2:
+                t["title"] = rest
+
+    # Album fallback: if there's no album tag, show the track's own title
+    # instead of a blank field (e.g. single "Gori" -> album "Gori").
+    if not t["album"] and t["title"]:
+        t["album"] = t["title"]
+
     return t
+
+
+def _build_known_artists(mp3s: list[Path], aliases: dict, auto_aliases: dict) -> dict:
+    """Cheap filename-only pre-pass: counts how many files resolve to each
+    (alias-applied) artist name, WITHOUT touching ID3 tags. Used only to
+    gate the title artist-strip above — a full mutagen-based count isn't
+    needed for a >=2 occurrence check."""
+    counts: dict = {}
+    for f in mp3s:
+        parts = f.stem.split(" - ", 2)
+        if len(parts) >= 3 and parts[0].strip().isdigit():
+            artist = normalize_artist(parts[1].strip())
+        else:
+            continue
+        for raw in split_artists(artist):
+            name = auto_aliases.get(raw, raw) if auto_aliases else raw
+            name = aliases.get(name, name) if aliases else name
+            key = name.strip().lower()
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 # ── Library discovery ──────────────────────────────────────
@@ -197,13 +256,15 @@ def get_tracks(force: bool = False) -> list:
             return _cache
         if not cfg.music_dir.exists():
             _cache = []; _cache_time = now; return []
-        meta    = load_json(cfg.meta_file,    {})
-        aliases = load_json(cfg.aliases_file, {})
-        mp3s    = get_all_mp3s()
+        meta         = load_json(cfg.meta_file,    {})
+        aliases      = load_json(cfg.aliases_file, {})
+        auto_aliases = load_json(cfg.auto_aliases_file, {})
+        mp3s         = get_all_mp3s()
+        known_artists = _build_known_artists(mp3s, aliases, auto_aliases)
         tracks  = []
         for f in mp3s:
             try:
-                tracks.append(parse_track(f, meta, aliases))
+                tracks.append(parse_track(f, meta, aliases, auto_aliases, known_artists))
             except Exception:
                 pass
         _PATH_INDEX = _rebuild_path_index(mp3s)

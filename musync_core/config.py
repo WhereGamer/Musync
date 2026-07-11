@@ -35,6 +35,7 @@ class Config:
         self.hist_file   = self.data_dir / "history.json"
         self.plists_file = self.data_dir / "playlists.json"
         self.aliases_file= self.data_dir / "artist_aliases.json"
+        self.auto_aliases_file = self.data_dir / "artist_aliases_auto.json"
         self.queue_file  = self.data_dir / "queue.json"
         self.settings_file = self.data_dir / "settings.json"
         self.color_cache_file = self.data_dir / "color_cache.json"
