@@ -34,7 +34,7 @@
 
 1. Склонируйте репозиторий:
 ```bash
-git clone https://github.com/yourusername/musync.git
+git clone https://github.com/WhereGamer/Musync.git
 cd musync
 ```
 
