@@ -356,21 +356,13 @@ def find_duplicate(title: str, artist: str, duration: int = 0) -> Optional[dict]
 
 
 # ── Reindex (two-pass, rename-safe) ──────────────────────
-def reindex_folder(folder: str = "") -> dict:
-    target_dir = cfg.music_dir / folder if folder else cfg.music_dir
-    if not target_dir.exists():
-        return {"renamed": 0, "changes": []}
-
-    def sort_key(p: Path):
-        parts = p.stem.split(" - ", 2)
-        num   = int(parts[0]) if parts and parts[0].strip().isdigit() else 999999
-        return (num, p.stem.lower())
-
-    mp3s = sorted(target_dir.glob("*.mp3"), key=sort_key)
+def _apply_order(target_dir: Path, ordered_mp3s: list) -> dict:
+    """Renumber ordered_mp3s to 001..N in the given order, renaming the mp3
+    plus any paired video file and cover to match. Shared by reindex_folder
+    (natural/sorted order) and reorder_track (a manual drag-and-drop order)."""
     changes = []
     temp_map = []
-
-    for i, mp3 in enumerate(mp3s, 1):
+    for i, mp3 in enumerate(ordered_mp3s, 1):
         new_num  = f"{i:03d}"
         parts    = mp3.stem.split(" - ", 2)
         rest     = " - ".join(parts[1:]) if len(parts) > 1 else mp3.stem
@@ -395,6 +387,70 @@ def reindex_folder(folder: str = "") -> dict:
 
     invalidate_cache()
     return {"renamed": len(changes), "changes": changes}
+
+
+def _folder_sort_key(p: Path):
+    parts = p.stem.split(" - ", 2)
+    num   = int(parts[0]) if parts and parts[0].strip().isdigit() else 999999
+    return (num, p.stem.lower())
+
+
+def reindex_folder(folder: str = "") -> dict:
+    target_dir = cfg.music_dir / folder if folder else cfg.music_dir
+    if not target_dir.exists():
+        return {"renamed": 0, "changes": []}
+    mp3s = sorted(target_dir.glob("*.mp3"), key=_folder_sort_key)
+    return _apply_order(target_dir, mp3s)
+
+
+def reorder_track(folder: str, filename: str, new_position: int) -> dict:
+    """Move `filename` to a new 1-indexed position within its folder and
+    renumber everything else to match — e.g. dragging track "103" up to
+    slot 96 makes it "096" and shifts 96..102 down by one. Backs the
+    drag-and-drop reorder in the "All tracks" list."""
+    target_dir = cfg.music_dir / folder if folder else cfg.music_dir
+    if not target_dir.exists():
+        return {"renamed": 0, "changes": [], "error": "folder not found"}
+
+    mp3s = sorted(target_dir.glob("*.mp3"), key=_folder_sort_key)
+    moved = next((p for p in mp3s if p.name == filename), None)
+    if not moved:
+        return {"renamed": 0, "changes": [], "error": "file not found"}
+
+    mp3s.remove(moved)
+    pos = max(0, min(new_position - 1, len(mp3s)))
+    mp3s.insert(pos, moved)
+
+    result = _apply_order(target_dir, mp3s)
+
+    # Keep playlist track-lists and the sync video_id index consistent with
+    # whatever got renamed as a side effect of the renumbering.
+    if result["renamed"]:
+        rename_map = {c["old"]: c["new"] for c in result["changes"]}
+        try:
+            from .playlists import get_all as _get_all_pl, save_all as _save_all_pl
+            pls = _get_all_pl()
+            changed = False
+            for pl in pls.values():
+                new_tracks = [rename_map.get(fn, fn) for fn in pl.get("tracks", [])]
+                if new_tracks != pl.get("tracks", []):
+                    pl["tracks"] = new_tracks
+                    changed = True
+            if changed:
+                _save_all_pl(pls)
+        except Exception:
+            pass
+        try:
+            from .sync import load_index, save_index
+            index = load_index()
+            for entry in index.values():
+                if entry.get("folder", "") == folder and entry.get("file") in rename_map:
+                    entry["file"] = rename_map[entry["file"]]
+            save_index(index)
+        except Exception:
+            pass
+
+    return result
 
 
 def reindex_all() -> dict:

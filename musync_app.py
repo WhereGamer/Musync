@@ -33,6 +33,7 @@ from musync_core import playlists as P
 from musync_core import duplicates as D
 from musync_core import cover_color as CC
 from musync_core import sync as SY
+from musync_core import watcher as W
 
 try:
     from mutagen.id3 import ID3, APIC
@@ -248,11 +249,15 @@ def api_normalize():
 # ════════════════════════════════════════════════════════
 @app.route("/api/lyrics")
 def api_lyrics():
-    fn     = request.args.get("fn", "")
-    title  = request.args.get("title", "")
-    artist = request.args.get("artist", "")
-    album  = request.args.get("album", "")
-    dur    = request.args.get("duration", "")
+    """Manual lookup (lyrics panel opened by the user) — always allowed to
+    search online regardless of the auto-fetch setting, since this is an
+    explicit request, not a background one."""
+    fn       = request.args.get("fn", "")
+    video_id = request.args.get("video_id", "")
+    title    = request.args.get("title", "")
+    artist   = request.args.get("artist", "")
+    album    = request.args.get("album", "")
+    dur      = request.args.get("duration", "")
     if fn and (not album or not dur or not title or not artist):
         for t in T.get_tracks():
             if t.get("filename") == fn:
@@ -265,7 +270,26 @@ def api_lyrics():
         dur = float(dur) if dur else 0
     except Exception:
         dur = 0
-    return jsonify(L.get_lyrics(fn, title, artist, album, dur))
+    return jsonify(L.get_lyrics(fn, title, artist, album, dur, video_id=video_id))
+
+@app.route("/api/lyrics/auto")
+def api_lyrics_auto():
+    """Background lookup fired automatically on track start (local or
+    online-listen). Honours the 'auto_fetch_lyrics' setting server-side
+    too, so a client that doesn't check it can't bypass it."""
+    if not cfg.load_settings().get("auto_fetch_lyrics", True):
+        return jsonify({"synced": False, "lines": [], "plain": "", "source": "disabled"})
+    fn       = request.args.get("fn", "")
+    video_id = request.args.get("video_id", "")
+    title    = request.args.get("title", "")
+    artist   = request.args.get("artist", "")
+    album    = request.args.get("album", "")
+    dur      = request.args.get("duration", "")
+    try:
+        dur = float(dur) if dur else 0
+    except Exception:
+        dur = 0
+    return jsonify(L.get_lyrics(fn, title, artist, album, dur, video_id=video_id, auto_save=True))
 
 @app.route("/api/lyrics/save", methods=["POST"])
 def api_lyrics_save():
@@ -451,6 +475,21 @@ def api_reindex():
     T.invalidate_cache()
     return jsonify(result)
 
+@app.route("/api/reorder", methods=["POST"])
+def api_reorder():
+    """Drag-and-drop reorder in 'All tracks': move one track to a new
+    1-indexed position within its folder, renumbering the rest to match
+    (e.g. track '103' dragged up becomes '096', shifting others down)."""
+    data = request.get_json(silent=True) or {}
+    filename = Path(data.get("filename", "")).name
+    folder   = data.get("folder", "")
+    position = int(data.get("position", 1))
+    if not filename:
+        return jsonify({"error": "no filename"}), 400
+    result = T.reorder_track(folder, filename, position)
+    T.invalidate_cache()
+    return jsonify(result)
+
 # ════════════════════════════════════════════════════════
 #  SETTINGS / MUSIC_DIR
 # ════════════════════════════════════════════════════════
@@ -467,7 +506,13 @@ def api_settings_save():
         cfg.music_dir = data["music_dir"]
         T.invalidate_cache()
     cfg.save_settings(data)
+    if "music_dir" in data or "watch_library" in data:
+        W.start()  # idempotent; re-points the watcher at the (possibly new) music_dir
     return jsonify({"ok": True})
+
+@app.route("/api/watcher/status")
+def api_watcher_status():
+    return jsonify({"available": W.WATCHDOG, "running": W.is_running()})
 
 # ════════════════════════════════════════════════════════
 #  THEME — user-supplied CSS, injected client-side as the
@@ -572,6 +617,55 @@ def api_sync_log():
 def api_sync_stop():
     ok = SY.stop_latest_sync()
     return jsonify({"ok": ok, "msg": "Stopping..." if ok else "No active sync to stop"})
+
+# ── Per-download job control (pause / resume / cancel / reorder) ──
+# Operates on the currently-running sync's DownloadManager queue.
+# job_id is the YouTube video_id.
+@app.route("/api/sync/jobs")
+def api_sync_jobs():
+    syncer = SY.get_latest_syncer()
+    jobs = getattr(syncer, "jobs_by_vid", None) if syncer else None
+    if not jobs:
+        return jsonify([])
+    return jsonify([j.to_dict() for j in jobs.values()])
+
+@app.route("/api/sync/jobs/<job_id>/pause", methods=["POST"])
+def api_sync_job_pause(job_id):
+    syncer = SY.get_latest_syncer()
+    jobs = getattr(syncer, "jobs_by_vid", None) if syncer else None
+    job = jobs.get(job_id) if jobs else None
+    if not job: return jsonify({"ok": False, "msg": "job not found"}), 404
+    job.request_pause()
+    return jsonify({"ok": True})
+
+@app.route("/api/sync/jobs/<job_id>/resume", methods=["POST"])
+def api_sync_job_resume(job_id):
+    syncer = SY.get_latest_syncer()
+    jobs = getattr(syncer, "jobs_by_vid", None) if syncer else None
+    job = jobs.get(job_id) if jobs else None
+    if not job: return jsonify({"ok": False, "msg": "job not found"}), 404
+    job.request_resume()
+    return jsonify({"ok": True})
+
+@app.route("/api/sync/jobs/<job_id>/cancel", methods=["POST"])
+def api_sync_job_cancel(job_id):
+    syncer = SY.get_latest_syncer()
+    jobs = getattr(syncer, "jobs_by_vid", None) if syncer else None
+    job = jobs.get(job_id) if jobs else None
+    if not job: return jsonify({"ok": False, "msg": "job not found"}), 404
+    job.request_cancel()
+    return jsonify({"ok": True})
+
+@app.route("/api/sync/jobs/<job_id>/priority", methods=["POST"])
+def api_sync_job_priority(job_id):
+    syncer = SY.get_latest_syncer()
+    jobs = getattr(syncer, "jobs_by_vid", None) if syncer else None
+    job = jobs.get(job_id) if jobs else None
+    mgr = getattr(syncer, "download_manager", None) if syncer else None
+    if not job or not mgr: return jsonify({"ok": False, "msg": "job not found"}), 404
+    priority = int((request.get_json(silent=True) or {}).get("priority", 0))
+    mgr.set_priority(job_id, priority)
+    return jsonify({"ok": True})
 
 # ════════════════════════════════════════════════════════
 #  NGROK / TUNNEL STATUS
@@ -737,6 +831,7 @@ def api_config():
 #  STARTUP — must be last (after all @app.route definitions)
 # ════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    watcher_started = W.start()
     w = 54
     print()
     print("  ╔" + "═" * w + "╗")
@@ -746,6 +841,7 @@ if __name__ == "__main__":
     print("  ║" + f"  mutagen: {'✓' if MUTAGEN  else '✗  pip install mutagen'}".ljust(w) + "║")
     print("  ║" + f"  pillow : {'✓' if PIL      else '✗  pip install pillow'}".ljust(w) + "║")
     print("  ║" + f"  request: {'✓' if REQUESTS else '✗  pip install requests'}".ljust(w) + "║")
+    print("  ║" + f"  watcher: {'✓' if watcher_started else ('✗  pip install watchdog' if not W.WATCHDOG else '✗  disabled in settings')}".ljust(w) + "║")
     print("  ╠" + "═" * w + "╣")
     print("  ║" + "  → http://localhost:5000".ljust(w) + "║")
     print("  ╚" + "═" * w + "╝")

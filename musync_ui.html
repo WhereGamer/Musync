@@ -544,6 +544,18 @@ select.inp{cursor:pointer}
 .pli-x{padding:8px;color:var(--t3);font-size:17px;cursor:pointer}
 
 .qr{display:flex;align-items:center;gap:10px;padding:8px 14px;cursor:pointer;transition:background .1s}
+.qr.dragging,.tr.dragging{opacity:.4}
+.qr.drag-over,.tr.drag-over{box-shadow:inset 0 2px 0 var(--acc)}
+.qr-drag{cursor:grab;color:var(--t3);font-size:14px;touch-action:none}
+.sync-job{display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:var(--rs);background:var(--s2);font-size:12px}
+.sync-job.st-downloading{background:rgba(80,150,255,.12)}
+.sync-job.st-paused{background:rgba(255,190,60,.12)}
+.sync-job.st-error{background:rgba(255,70,70,.1)}
+.sj-ico{width:16px;text-align:center;flex-shrink:0}
+.sj-lbl{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--t2)}
+.sj-st{color:var(--t3);font-size:11px;flex-shrink:0}
+.sj-actions{display:flex;gap:4px;flex-shrink:0}
+.sj-btn{width:24px;height:24px;border-radius:6px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.06);color:var(--t1);font-size:12px;cursor:pointer}
 .qr:active{background:var(--s2)}.qr.now{background:var(--acc-s)}
 .qr-n{font-size:12px;color:var(--t3);min-width:20px;text-align:right;flex-shrink:0}
 .qr-art{width:38px;height:38px;border-radius:var(--rx);object-fit:cover;background:var(--s3);flex-shrink:0}
@@ -841,7 +853,10 @@ select.inp{cursor:pointer}
 <div class="page" id="pg-tracks">
   <div class="tbar">
     <div class="tbar-plain">All tracks</div>
-    <div class="tbar-act"><span style="font-size:13px;color:var(--t2)" id="tracks-cnt"></span></div>
+    <div class="tbar-act">
+      <button class="btn se sm" id="reorder-toggle" onclick="toggleReorderMode()" style="margin-right:8px">↕ Reorder</button>
+      <span style="font-size:13px;color:var(--t2)" id="tracks-cnt"></span>
+    </div>
   </div>
   <div class="chips" id="tracks-sort-chips">
     <div class="chip on" data-s="filename" onclick="sortChipTracks(this)">Default</div>
@@ -924,6 +939,7 @@ select.inp{cursor:pointer}
           <div class="sync-st"><div class="sync-st-n" id="ss-e" style="color:var(--err)">0</div><div class="sync-st-l">Errors</div></div>
         </div>
         <div style="max-height:150px;overflow-y:auto;padding:8px 12px" id="sync-log"></div>
+        <div id="sync-jobs" style="max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:4px"></div>
         <div id="sync-summ" style="display:none;padding:10px 12px;background:var(--s2);border-radius:var(--rs);font-size:13px;color:var(--t2)"></div>
       </div>
     </div>
@@ -1159,7 +1175,16 @@ select.inp{cursor:pointer}
     </div>
     <div class="sr" onclick="toggleCfg('crossfade')"><div class="sr-ico">🔀</div><div class="sr-i"><div class="sr-t">Crossfade</div></div><button class="tog" id="t-crossfade"></button></div>
     <div class="sr" onclick="toggleCfg('fadeOut')"><div class="sr-ico">📉</div><div class="sr-i"><div class="sr-t">Fade out</div><div class="sr-s">Last 5s</div></div><button class="tog" id="t-fadeOut"></button></div>
-    <div class="sr" onclick="toggleCfg('loopAll')"><div class="sr-ico">🔁</div><div class="sr-i"><div class="sr-t">Loop library</div></div><button class="tog" id="t-loopAll"></button></div>
+    <div class="sr" onclick="toggleCfg('autoFetchLyrics')">
+      <div class="sr-ico">📝</div>
+      <div class="sr-i"><div class="sr-t">Auto-fetch lyrics</div><div class="sr-s">Look them up while you listen, save for offline</div></div>
+      <button class="tog" id="t-autoFetchLyrics"></button>
+    </div>
+    <div class="sr" onclick="toggleWatchLibrary()">
+      <div class="sr-ico">👁</div>
+      <div class="sr-i"><div class="sr-t">Watch library folder</div><div class="sr-s" id="watch-lib-status">Auto-detect files added/removed outside the app</div></div>
+      <button class="tog" id="t-watchLibrary"></button>
+    </div>
     <div class="sep"></div>
     <div class="sec-lbl">Artists</div>
     <div class="sr" onclick="openAliasSheet()"><div class="sr-ico">🏷</div><div class="sr-i"><div class="sr-t">Artist aliases</div><div class="sr-s">Merge duplicates</div></div><div class="sr-v">›</div></div>
@@ -1345,9 +1370,9 @@ select.inp{cursor:pointer}
 
 <script>
 // ══ STATE ══════════════════════════════════════════════
-let tracks=[], idx=-1, shuf=false, rep=false;
+let tracks=[], idx=-1, shuf=false, repMode='off'; // repMode: 'off' | 'all' | 'one'
 let _shufList=[], _shufPos=-1, _history=[], _pct70=false;
-let queue=[], qIdx=-1;
+let queue=[], qIdx=-1, _qDragFrom=null;
 let lyrData={synced:false,lines:[],plain:'',source:'none'};
 let playlists={}, _detail={}, _editFn='';
 let _muted=false, _prevVol=1, _artFlip=true, _foTimer=null;
@@ -1358,7 +1383,7 @@ let _searchTab='both'; // unified
 
 let cfg={
   theme:'dark', acc:'#e50914', autoAccent:false,
-  vol:1, spd:1, crossfade:false, fadeOut:false, loopAll:true,
+  vol:1, spd:1, crossfade:false, fadeOut:false, autoFetchLyrics:true,
   sortBy:'filename', sortAsc:true,
   profileName:'My Library',
   discordRpc:false, discordClientId:'',
@@ -1489,7 +1514,7 @@ async function boot(){
   setAccent(cfg.acc||'#e50914');
   _updateThemeCssStatus();
   au.volume=cfg.vol; au.playbackRate=cfg.spd||1;
-  syncUI(); buildThemeRow(); buildEQ();
+  syncUI(); buildThemeRow(); buildEQ(); _refreshWatchLibraryStatus();
   const pn=document.getElementById('prof-name-el');
   if(pn) pn.textContent=cfg.profileName||'My Library';
   // Show device ID
@@ -1564,7 +1589,7 @@ function buildThemeRow(){
 }
 
 function syncUI(){
-  ['crossfade','fadeOut','loopAll','autoAccent','discordRpc'].forEach(k=>{
+  ['crossfade','fadeOut','autoFetchLyrics','autoAccent','discordRpc'].forEach(k=>{
     const el=document.getElementById('t-'+k); if(el) el.classList.toggle('on',!!cfg[k]);
   });
   const ss=document.getElementById('spd-sel'); if(ss) ss.value=String(cfg.spd||1);
@@ -1770,11 +1795,60 @@ function buildHomeList(){
   if(cnt) cnt.textContent=s.length+(s.length!==tracks.length?' / '+tracks.length:'')+' tracks';
   _renderList(document.getElementById('home-list'), s);
 }
+let _reorderMode=false, _reorderDragFrom=null;
+function toggleReorderMode(){
+  if(_sb!=='filename'){ toast('Switch to "Default" sort to reorder'); return }
+  _reorderMode=!_reorderMode;
+  document.getElementById('reorder-toggle').classList.toggle('on',_reorderMode);
+  buildTracksList();
+  if(_reorderMode) toast('Drag ⠿ to reorder — renumbers files on drop');
+}
 function buildTracksList(){
   const s=getSorted();
   const cnt=document.getElementById('tracks-cnt');
   if(cnt) cnt.textContent=s.length+' tracks';
-  _renderList(document.getElementById('tracks-list'), s);
+  if(_reorderMode){
+    _buildReorderList(document.getElementById('tracks-list'), s);
+  } else {
+    _renderList(document.getElementById('tracks-list'), s);
+  }
+}
+function _buildReorderList(container, items){
+  // Full (non-virtualized) render — only used in reorder mode, which is an
+  // explicit opt-in for a bounded editing session, not the default scroll path.
+  if(!container) return;
+  container.innerHTML='';
+  const frag=document.createDocumentFragment();
+  items.forEach((t,i)=>{
+    const ri=tracks.indexOf(t);
+    const row=mkRow(t, ri, true);
+    row.draggable=true;
+    row.dataset.pos=i;
+    const handle=document.createElement('span');
+    handle.className='qr-drag'; handle.textContent='⠿'; handle.style.marginRight='4px';
+    row.insertBefore(handle, row.firstChild);
+    row.ondragstart=(e)=>{_reorderDragFrom=i; row.classList.add('dragging'); e.dataTransfer.effectAllowed='move'};
+    row.ondragend=()=>row.classList.remove('dragging');
+    row.ondragover=(e)=>{e.preventDefault(); row.classList.add('drag-over')};
+    row.ondragleave=()=>row.classList.remove('drag-over');
+    row.ondrop=async(e)=>{
+      e.preventDefault(); row.classList.remove('drag-over');
+      const to=i;
+      if(_reorderDragFrom==null||_reorderDragFrom===to) return;
+      const moved=items[_reorderDragFrom];
+      toast('Renaming files...');
+      try{
+        const r=await fetch('/api/reorder',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({filename:moved.filename, folder:moved.playlist_folder||'', position:to+1})});
+        const d=await r.json();
+        if(d.error){toast('Reorder failed: '+d.error)}
+        else{toast(`Moved — ${d.renamed} file(s) renumbered`); await refresh(); buildTracksList()}
+      }catch(err){toast('Reorder failed')}
+      _reorderDragFrom=null;
+    };
+    frag.appendChild(row);
+  });
+  container.appendChild(frag);
 }
 function _renderList(container, items){
   if(!container) return;
@@ -1995,6 +2069,7 @@ async function playOnline(item){
     b.src=cov; a.style.opacity='0'; b.style.opacity='1'; _artFlip=!_artFlip;
     document.getElementById('fs-bg').style.backgroundImage=`url('${cov}')`;
     _setPI('⏸'); toast('Playing: '+item.title);
+    _autoFetchLyrics({video_id:item.id,title:item.title,artist:item.artist||''});
   }catch(e){toast('Stream error')}
 }
 function openOnCtx(i){
@@ -2035,6 +2110,11 @@ function playRi(ri){
     const fi=setInterval(()=>{v=Math.max(0,v-.06);au.volume=v;if(v<=0){clearInterval(fi);_doPlay(t)}},80);
   } else _doPlay(t);
 }
+function _autoFetchLyrics(params){
+  if(!cfg.autoFetchLyrics) return;
+  const qs=new URLSearchParams(params).toString();
+  fetch('/api/lyrics/auto?'+qs).catch(()=>{});
+}
 function _doPlay(t){
   if(au.src?.startsWith('blob:')) URL.revokeObjectURL(au.src);
   au.src='/stream/'+enc(t.filename);
@@ -2048,6 +2128,7 @@ function _doPlay(t){
   if(cfg.autoAccent) _fetchAccent(t.filename);
   lyrData={synced:false,lines:[],plain:'',source:'none'};
   if(document.getElementById('lyr-ov').classList.contains('open')) loadLyrics(t);
+  _autoFetchLyrics({fn:t.filename,title:t.title,artist:t.artist||'',album:t.album||'',duration:t.duration||0});
   _hilightRows();
   _updateMediaSession(t);
   _buildUpNext();
@@ -2102,7 +2183,9 @@ function prev(){
 }
 function next(){
   if(queue.length>0&&qIdx>=0){
-    if(qIdx+1<queue.length){qIdx++;playRi(queue[qIdx]);return} else qIdx=-1;
+    if(qIdx+1<queue.length){qIdx++;playRi(queue[qIdx]);return}
+    else if(repMode==='all'){qIdx=0;playRi(queue[0]);return}
+    else qIdx=-1;
   }
   if(shuf){
     if(!_shufList.length||_shufPos>=_shufList.length-1){
@@ -2113,17 +2196,22 @@ function next(){
     _shufPos++; playRi(_shufList[_shufPos]); return;
   }
   if(idx<tracks.length-1) playRi(idx+1);
-  else if(cfg.loopAll&&tracks.length) playRi(0);
+  else if(repMode==='all'&&tracks.length) playRi(0);
 }
 function toggleShuf(){
   shuf=!shuf; _shufList=[]; _shufPos=-1;
   ['pb-shuf','fc-shuf'].forEach(id=>{const e=document.getElementById(id);if(e)e.classList.toggle('on',shuf)});
 }
 function toggleRep(){
-  rep=!rep;
-  ['pb-rep','fc-rep'].forEach(id=>{const e=document.getElementById(id);if(e)e.classList.toggle('on',rep)});
+  repMode = repMode==='off' ? 'all' : repMode==='all' ? 'one' : 'off';
+  ['pb-rep','fc-rep'].forEach(id=>{
+    const e=document.getElementById(id); if(!e) return;
+    e.classList.toggle('on', repMode!=='off');
+    e.textContent = repMode==='one' ? '↻¹' : '↻';
+    e.title = repMode==='off' ? 'Repeat off' : repMode==='all' ? 'Repeat all' : 'Repeat one';
+  });
 }
-au.addEventListener('ended',()=>{if(rep){au.play();return}next()});
+au.addEventListener('ended',()=>{if(repMode==='one'){au.play();return}next()});
 au.addEventListener('pause',()=>{_setPI('▶');try{navigator.mediaSession.playbackState='paused'}catch(e){}});
 au.addEventListener('play', ()=>{_setPI('⏸');try{navigator.mediaSession.playbackState='playing'}catch(e){}});
 
@@ -2145,7 +2233,7 @@ au.addEventListener('timeupdate',()=>{
   if(cfg.fadeOut&&!_foTimer&&au.duration>6&&(au.duration-au.currentTime)<5){
     _foTimer=setTimeout(()=>{
       let v=cfg.vol;
-      const fi=setInterval(()=>{v=Math.max(0,v-.02);au.volume=v;if(v<=0){clearInterval(fi);au.volume=cfg.vol;rep?au.play():next()}},100);
+      const fi=setInterval(()=>{v=Math.max(0,v-.02);au.volume=v;if(v<=0){clearInterval(fi);au.volume=cfg.vol;repMode==='one'?au.play():next()}},100);
     },0);
   }
 });
@@ -2365,9 +2453,25 @@ function buildQueueUI(){
   const ul=document.getElementById('q-body'); if(!ul) return; ul.innerHTML='';
   queue.forEach((ri,qi)=>{
     const t=tracks[ri]; if(!t) return;
-    const d=document.createElement('div'); d.className='qr'+(qi===qIdx?' now':''); d.dataset.ri=ri;
-    d.innerHTML=`<span class="qr-n">${qi+1}</span><img class="qr-art" src="/api/cover/${enc(t.filename)}" onerror="this.style.visibility='hidden'"><div class="qr-i"><div class="qr-t">${x(t.title)}</div><div class="qr-a">${x(t.artist||'')}</div></div><span class="qr-del" onclick="event.stopPropagation();queue.splice(${qi},1);buildQueueUI()">✕</span>`;
+    const d=document.createElement('div'); d.className='qr'+(qi===qIdx?' now':''); d.dataset.ri=ri; d.dataset.qi=qi;
+    d.draggable=true;
+    d.innerHTML=`<span class="qr-drag">⠿</span><span class="qr-n">${qi+1}</span><img class="qr-art" src="/api/cover/${enc(t.filename)}" onerror="this.style.visibility='hidden'"><div class="qr-i"><div class="qr-t">${x(t.title)}</div><div class="qr-a">${x(t.artist||'')}</div></div><span class="qr-del" onclick="event.stopPropagation();queue.splice(${qi},1);buildQueueUI()">✕</span>`;
     d.ondblclick=()=>{qIdx=qi;playRi(ri)};
+    d.ondragstart=(e)=>{_qDragFrom=qi; d.classList.add('dragging'); e.dataTransfer.effectAllowed='move'};
+    d.ondragend=()=>{d.classList.remove('dragging')};
+    d.ondragover=(e)=>{e.preventDefault(); d.classList.add('drag-over')};
+    d.ondragleave=()=>{d.classList.remove('drag-over')};
+    d.ondrop=(e)=>{
+      e.preventDefault(); d.classList.remove('drag-over');
+      const to=qi;
+      if(_qDragFrom==null||_qDragFrom===to) return;
+      const moved=queue.splice(_qDragFrom,1)[0];
+      // keep "now playing" pointing at the same track through the reorder
+      const nowRi=qIdx>=0?queue[qIdx]:null;
+      queue.splice(to,0,moved);
+      if(nowRi!=null) qIdx=queue.indexOf(nowRi);
+      _qDragFrom=null; buildQueueUI(); _saveQueueToServer();
+    };
     ul.appendChild(d);
   });
   _buildUpNext();
@@ -2579,12 +2683,6 @@ function openCtx(ri){
      buildQueueUI();_saveQueueToServer();toast('▶ Play next')
    }},
    {ico:'📋',lbl:'Add to queue',fn:()=>addToQ(ri)},
-   {ico:'⏩',lbl:'Play after current',fn:()=>{
-     const pos=idx>=0?idx+1:0;
-     queue.splice(pos,0,ri);
-     if(qIdx>=pos) qIdx++;
-     buildQueueUI();_saveQueueToServer();toast('Added after current')
-   }},
    {ico:'🎵',lbl:'Add to playlist',fn:()=>openPlModal(ri)},
    {ico:'📝',lbl:'Lyrics',fn:()=>{if(idx!==ri)playRi(ri);setTimeout(openLyrOv,400)}},
    {ico:'✎',lbl:'Edit track',fn:()=>openEdit(ri)},
@@ -2736,6 +2834,7 @@ async function _pollSync(){
       line.appendChild(ico); line.appendChild(txt); logEl.appendChild(line);
     });
     logEl.scrollTop=logEl.scrollHeight;
+    _pollSyncJobs();
     if(d.stop_requested && d.running){
       document.getElementById('sync-ttl').textContent='Stopping...';
     }
@@ -2751,6 +2850,47 @@ async function _pollSync(){
       if(Notification.permission==='granted') new Notification('MUSYNC',{body:`${dl} downloaded · ${sk} skipped`});
       await refresh(); toast(d.stop_requested?'Sync stopped':'Sync complete!');
     }
+  }catch(e){}
+}
+async function _pollSyncJobs(){
+  try{
+    const r=await fetch('/api/sync/jobs'); const jobs=await r.json();
+    const box=document.getElementById('sync-jobs'); if(!box) return;
+    box.innerHTML='';
+    // active first (downloading/paused), then queued, then finished
+    const order={downloading:0,paused:1,queued:2,done:3,error:4,cancelled:5};
+    jobs.sort((a,b)=>(order[a.status]??9)-(order[b.status]??9) || b.priority-a.priority);
+    jobs.slice(0,40).forEach(j=>{
+      const row=document.createElement('div');
+      row.className='sync-job st-'+j.status;
+      const icon={queued:'⏳',downloading:'⬇',paused:'⏸',done:'✓',error:'✗',cancelled:'⊘'}[j.status]||'•';
+      row.innerHTML=`<span class="sj-ico">${icon}</span><span class="sj-lbl">${x(j.label)}</span><span class="sj-st">${j.status}</span><span class="sj-actions"></span>`;
+      const act=row.querySelector('.sj-actions');
+      if(j.status==='downloading'||j.status==='queued'){
+        const b=document.createElement('button'); b.className='sj-btn'; b.textContent='⏸';
+        b.onclick=()=>_syncJobAction(j.id,'pause'); act.appendChild(b);
+      }
+      if(j.status==='paused'){
+        const b=document.createElement('button'); b.className='sj-btn'; b.textContent='▶';
+        b.onclick=()=>_syncJobAction(j.id,'resume'); act.appendChild(b);
+      }
+      if(j.status==='queued'||j.status==='downloading'||j.status==='paused'){
+        const bUp=document.createElement('button'); bUp.className='sj-btn'; bUp.textContent='⬆';
+        bUp.title='Bump priority'; bUp.onclick=()=>_syncJobPriority(j.id,(j.priority||0)+10); act.appendChild(bUp);
+        const bX=document.createElement('button'); bX.className='sj-btn'; bX.textContent='✕';
+        bX.onclick=()=>_syncJobAction(j.id,'cancel'); act.appendChild(bX);
+      }
+      box.appendChild(row);
+    });
+  }catch(e){}
+}
+async function _syncJobAction(id,action){
+  try{ await fetch(`/api/sync/jobs/${enc(id)}/${action}`,{method:'POST'}); _pollSyncJobs(); }catch(e){}
+}
+async function _syncJobPriority(id,priority){
+  try{
+    await fetch(`/api/sync/jobs/${enc(id)}/priority`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority})});
+    _pollSyncJobs();
   }catch(e){}
 }
 async function checkNgrok(){
@@ -3237,7 +3377,31 @@ function _updateMediaSession(t){
 // ══ SHEETS + OVERLAYS ══════════════════════════════════
 function openSheet(id){closeSheets();document.getElementById('ov').classList.add('on');document.getElementById(id).classList.add('on')}
 function closeSheets(){document.getElementById('ov').classList.remove('on');document.querySelectorAll('.sheet').forEach(s=>s.classList.remove('on'))}
-function toggleCfg(key){cfg[key]=!cfg[key];saveCfg();const el=document.getElementById('t-'+key);if(el)el.classList.toggle('on',!!cfg[key])}
+async function toggleWatchLibrary(){
+  const el=document.getElementById('t-watchLibrary');
+  const next=!el.classList.contains('on');
+  el.classList.toggle('on',next);
+  try{
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({watch_library:next})});
+    await _refreshWatchLibraryStatus();
+  }catch(e){}
+}
+async function _refreshWatchLibraryStatus(){
+  try{
+    const r=await fetch('/api/watcher/status'); const d=await r.json();
+    const el=document.getElementById('t-watchLibrary'); if(el) el.classList.toggle('on', d.running);
+    const s=document.getElementById('watch-lib-status');
+    if(s) s.textContent = d.available ? 'Auto-detect files added/removed outside the app' : 'Needs: pip install watchdog';
+  }catch(e){}
+}
+async function toggleCfg(key){
+  cfg[key]=!cfg[key]; saveCfg();
+  const el=document.getElementById('t-'+key); if(el)el.classList.toggle('on',!!cfg[key]);
+  if(key==='autoFetchLyrics'){
+    fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({auto_fetch_lyrics:cfg.autoFetchLyrics})}).catch(()=>{});
+  }
+}
 
 // ══ SWIPE ══════════════════════════════════════════════
 function initSwipe(){

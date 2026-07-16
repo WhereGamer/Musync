@@ -28,6 +28,7 @@ from .config import cfg
 from .storage import load_json, save_json
 from .tracks import normalize_title, normalize_artist, get_all_mp3s, invalidate_cache, reindex_folder
 from .playlists import create_or_get_by_name, add_track_to_playlist, get_all as get_all_playlists, save_all as save_all_playlists
+from .download_manager import get_download_manager, run_popen as _run_popen
 
 def find_cookies_file() -> Path | None:
     """
@@ -442,23 +443,48 @@ class Syncer:
     def _download_all(self, items, folder, playlist_id, index):
         p = self.progress
         sem = threading.Semaphore(self.jobs)
-        threads = []
+        mgr = get_download_manager(self.jobs)
+        self.download_manager = mgr
+        self.jobs_by_vid = {}   # vid -> Job, so the API layer can pause/cancel/reprioritize
+        done = threading.Event()
+        remaining = [0]
+        lock = threading.Lock()
 
-        for (idx, vid, title, up, dur) in items:
+        def _make_run_fn(idx, vid, title, up, dur):
+            def _run(job):
+                if p.stop_requested:
+                    return
+                self._download_one(sem, job, idx, vid, title, up, dur, folder, playlist_id, index)
+            return _run
+
+        for pos, (idx, vid, title, up, dur) in enumerate(items):
             if p.stop_requested:
-                p.emit(f"[MUSYNC] Stopped — {len(items) - items.index((idx,vid,title,up,dur))} remaining track(s) not started.")
+                p.emit(f"[MUSYNC] Stopped — {len(items) - pos} remaining track(s) not queued.")
                 break
-            t = threading.Thread(
-                target=self._download_one,
-                args=(sem, idx, vid, title, up, dur, folder, playlist_id, index)
-            )
-            t.start()
-            threads.append(t)
+            # Earlier playlist position = higher priority by default, so the
+            # queue downloads roughly in source order unless re-prioritized.
+            job = mgr.submit(job_id=vid or f"pos{idx}", run_fn=_make_run_fn(idx, vid, title, up, dur),
+                              priority=-idx, label=f"{title} — {up}")
+            self.jobs_by_vid[vid] = job
 
-        for t in threads:
-            t.join()
+        def _watch(j):
+            j_done_states = ("done", "error", "cancelled")
+            while j.status not in j_done_states:
+                time.sleep(0.3)
+            with lock:
+                remaining[0] -= 1
+                if remaining[0] <= 0:
+                    done.set()
 
-    def _download_one(self, sem, idx, vid, title, uploader, duration,
+        watchers = [threading.Thread(target=_watch, args=(j,), daemon=True) for j in self.jobs_by_vid.values()]
+        remaining[0] = len(watchers)
+        if not watchers:
+            return
+        for w in watchers: w.start()
+        done.wait()
+        for w in watchers: w.join(timeout=1)
+
+    def _download_one(self, sem, job, idx, vid, title, uploader, duration,
                        folder, playlist_id, index):
         with sem:
             p = self.progress
@@ -511,12 +537,22 @@ class Syncer:
                     "--fragment-retries", "3",
                     _dl_url,
                 ]
+                if job.cancelled.is_set():
+                    p.emit(f"  ✗ cancelled: {stitle}")
+                    with self._lock: p.skipped += 1
+                    success = True  # stop retrying, this is a deliberate stop
+                    break
                 try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                    result = _run_popen(cmd, job, timeout=180)
                 except subprocess.TimeoutExpired:
                     p.emit(f"  ✗ timeout: {stitle}")
                     time.sleep(5 * attempt)
                     continue
+                if job.cancelled.is_set():
+                    p.emit(f"  ✗ cancelled: {stitle}")
+                    with self._lock: p.skipped += 1
+                    success = True
+                    break
 
                 if result.returncode == 0:
                     actual = None
@@ -538,6 +574,12 @@ class Syncer:
                         p.emit(f"  ↓ {num}  {stitle}  ({artist})")
                         if playlist_id:
                             add_track_to_playlist(playlist_id, expected)
+                        if vid:
+                            try:
+                                from . import lyrics as L
+                                L.migrate_online_lyrics(vid, expected)
+                            except Exception:
+                                pass
                         success = True
                     else:
                         p.emit(f"  ✗ file missing after download: {stitle}")

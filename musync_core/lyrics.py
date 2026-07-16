@@ -42,6 +42,7 @@ in gets word-level karaoke for free too.
 """
 import re
 from pathlib import Path
+from typing import Optional
 from .config import cfg
 
 try:
@@ -216,10 +217,64 @@ def _from_lrclib(title: str, artist: str, album: str = "", duration=0):
 
 
 # ── Orchestration ───────────────────────────────────────────────────────
+# Strategy pattern: each remote source is a small class implementing the
+# same fetch() interface. get_lyrics() just walks the list in order and
+# uses the first one that returns a result — if Better Lyrics is down or
+# rate-limited, LRCLib is tried next with zero change to the calling code.
+# Adding a new source later is just adding another class to REMOTE_SOURCES.
 
-REMOTE_SOURCES = (_from_better_lyrics, _from_lrclib)
+class LyricsProvider:
+    name = "base"
+    def fetch(self, title: str, artist: str, album: str = "", duration=0) -> Optional[dict]:
+        raise NotImplementedError
 
-def get_lyrics(fn: str, title: str = "", artist: str = "", album: str = "", duration=0) -> dict:
+
+class BetterLyricsProvider(LyricsProvider):
+    name = "better-lyrics"
+    def fetch(self, title, artist, album="", duration=0):
+        return _from_better_lyrics(title, artist, album, duration)
+
+
+class LRCLibProvider(LyricsProvider):
+    name = "lrclib"
+    def fetch(self, title, artist, album="", duration=0):
+        return _from_lrclib(title, artist, album, duration)
+
+
+REMOTE_SOURCES = (BetterLyricsProvider(), LRCLibProvider())
+
+
+def _fetch_remote(title: str, artist: str, album: str = "", duration=0) -> Optional[dict]:
+    for provider in REMOTE_SOURCES:
+        try:
+            res = provider.fetch(title, artist, album, duration)
+        except Exception:
+            res = None
+        if res:
+            return res
+    return None
+
+
+def _online_lrc_file(video_id: str) -> Path:
+    return cfg.lyrics_dir / f"online_{video_id}.lrc"
+
+def _online_txt_file(video_id: str) -> Path:
+    return cfg.lyrics_dir / f"online_{video_id}.txt"
+
+
+def get_lyrics(fn: str = "", title: str = "", artist: str = "", album: str = "",
+                duration=0, video_id: str = "", auto_save: bool = True) -> dict:
+    """
+    fn        — local library filename (existing behaviour).
+    video_id  — set instead of fn for a track being listened to online
+                (not yet downloaded) so a match can still be cached and
+                reused, including once the track IS downloaded later
+                (see migrate_online_lyrics()).
+    auto_save — if False, a found remote match is returned but NOT cached
+                locally (respects the "auto-fetch lyrics" setting being
+                off, while still letting someone open the lyrics panel
+                and search manually).
+    """
     empty = {"synced": False, "lines": [], "plain": "", "source": "none"}
     if fn:
         lf = lrc_file(fn)
@@ -228,21 +283,56 @@ def get_lyrics(fn: str, title: str = "", artist: str = "", album: str = "", dura
         tf = txt_file(fn)
         if tf.exists():
             return {"synced": False, "lines": [], "plain": tf.read_text("utf-8"), "source": "local"}
+    elif video_id:
+        lf = _online_lrc_file(video_id)
+        if lf.exists():
+            return parse_lrc(lf.read_text("utf-8"), "local")
+        tf = _online_txt_file(video_id)
+        if tf.exists():
+            return {"synced": False, "lines": [], "plain": tf.read_text("utf-8"), "source": "local"}
+
     if title or artist:
-        for fetcher in REMOTE_SOURCES:
-            res = fetcher(title, artist, album, duration)
-            if not res:
-                continue
-            if fn:  # cache the match locally so replays (on any device) skip the network
-                try:
-                    if res["synced"]:
-                        save_lyrics(fn, to_lrc(res), True)
-                    elif res.get("plain"):
-                        save_lyrics(fn, res["plain"], False)
-                except Exception:
-                    pass
+        res = _fetch_remote(title, artist, album, duration)
+        if res and auto_save:
+            try:
+                if fn:
+                    if res["synced"]: save_lyrics(fn, to_lrc(res), True)
+                    elif res.get("plain"): save_lyrics(fn, res["plain"], False)
+                elif video_id:
+                    save_online_lyrics(video_id, to_lrc(res) if res["synced"] else res.get("plain", ""), res["synced"])
+            except Exception:
+                pass
+        if res:
             return res
     return empty
+
+
+def save_online_lyrics(video_id: str, text: str, synced: bool):
+    """Cache lyrics found while listening to a not-yet-downloaded track,
+    keyed by its YouTube video_id so they survive across sessions and
+    can be migrated onto the real file once it's downloaded."""
+    if not text:
+        return
+    dest = _online_lrc_file(video_id) if synced else _online_txt_file(video_id)
+    dest.write_text(text, "utf-8")
+    other = _online_txt_file(video_id) if synced else _online_lrc_file(video_id)
+    try: other.unlink()
+    except Exception: pass
+
+
+def migrate_online_lyrics(video_id: str, fn: str):
+    """Called after a track finishes downloading: if lyrics were cached
+    for it while it was being listened to online, attach them to the real
+    file so they work fully offline, then drop the online-only copy."""
+    for src, synced in ((_online_lrc_file(video_id), True), (_online_txt_file(video_id), False)):
+        if src.exists():
+            try:
+                save_lyrics(fn, src.read_text("utf-8"), synced)
+                src.unlink()
+            except Exception:
+                pass
+            return
+
 
 def save_lyrics(fn: str, text: str, synced: bool):
     dest = lrc_file(fn) if synced else txt_file(fn)
@@ -250,8 +340,47 @@ def save_lyrics(fn: str, text: str, synced: bool):
     other = txt_file(fn) if synced else lrc_file(fn)
     try: other.unlink()  # don't leave a stale copy in the other format
     except Exception: pass
+    _embed_id3_lyrics(fn, text, synced)
 
 def delete_lyrics(fn: str):
     for f in (lrc_file(fn), txt_file(fn)):
         try: f.unlink()
         except Exception: pass
+
+
+# ── ID3 embedding (SYLT/USLT) — makes the mp3 itself carry the lyrics,
+# so they work fully offline even if .musync_data is ever lost/not synced
+# to another device, e.g. copying just the mp3 elsewhere. ──────────────
+def _embed_id3_lyrics(fn: str, text: str, synced: bool):
+    try:
+        from mutagen.id3 import ID3, USLT, SYLT, Encoding
+    except Exception:
+        return
+    try:
+        from .tracks import resolve_track_path
+    except Exception:
+        return
+    path = resolve_track_path(fn)
+    if not path or not path.exists():
+        return
+    try:
+        try: tags = ID3(str(path))
+        except Exception: tags = ID3()
+        # Always keep a plain USLT (unsynced) copy — needed as a fallback
+        # for players/tags that don't understand SYLT.
+        plain = text
+        if synced:
+            res = parse_lrc(text, "local")
+            plain = "\n".join(l["text"] for l in res.get("lines", [])) or text
+        tags.setall("USLT", [USLT(encoding=Encoding.UTF8, lang="eng", desc="", text=plain)])
+        if synced:
+            res = parse_lrc(text, "local")
+            events = [(int(round(l["time"] * 1000)), l["text"]) for l in res.get("lines", [])]
+            if events:
+                tags.setall("SYLT", [SYLT(encoding=Encoding.UTF8, lang="eng", format=2,
+                                           type=1, desc="", text=events)])
+        else:
+            tags.delall("SYLT")
+        tags.save(str(path))
+    except Exception:
+        pass
